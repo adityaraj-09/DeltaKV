@@ -12,21 +12,30 @@ class DeltaKVConfig:
     """Product defaults: never worse than flush-and-recompute."""
 
     error_budget: ErrorBudget = field(default_factory=ErrorBudget)
-    # Probe-anchored correction (AgentKVShift trigger, weight-axis scores).
+    # Probe-anchored correction (weight-axis scores + LoRA-subspace shift).
     probe_ratio: float = 0.10
     probe_min_tokens: int = 4
     probe_max_ratio: float = 0.50
+    # Progressive probe caps (LoRC: more budget in shallow / high-κ layers).
+    probe_shallow_ratio: float = 0.20
+    probe_deep_ratio: float = 0.05
     # CacheBlend-style residual gate: tokens above this relative L2 are
-    # fully recomputed even after the mean-shift.
+    # fully recomputed even after the subspace shift.
     blend_residual_threshold: float = 0.15
     blend_max_recompute_ratio: float = 0.40
     # Rank used to compress dense ΔW (quant / RL) and ΔX during analytic
     # hidden-state propagation.
     propagator_rank: int = 64
+    # Store residual-stream snapshots; Route A / exact boundaries read them.
     store_hidden_states: bool = True
     hidden_dtype: str = "float16"
-    # Preferred patch route. ``auto`` picks the cheapest route that fits ε.
-    preferred_route: str = "auto"
+    # Exact-patch + ΔX reset every this many layers (0 = every layer stored,
+    # reset every ``hidden_stride`` during analytic compounding).
+    hidden_stride: int = 4
+    # Layers with normalized cumulative κ at or above this get a PROBE strategy.
+    kappa_probe_threshold: float = 0.65
+    # Preferred patch route. ``hybrid`` / ``auto`` mix per-layer strategies.
+    preferred_route: str = "hybrid"
     # Lipschitz proxy for zeroth-order error compounding (LoRC-style).
     layer_lipschitz: float = 1.2
     # Beyond this ‖ΔW‖ proxy the delta is not "small by construction" and we

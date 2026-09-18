@@ -47,6 +47,7 @@ def attention_first_order(
     head_dim: int,
     rope: RotaryEmbedding,
     causal_mask: Tensor,
+    base_weights: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Return ``(Δh_attn, ΔK, ΔV, attn_probs)`` for one block.
 
@@ -69,6 +70,11 @@ def attention_first_order(
         dq = dq + packed_delta(x, layer.get("q_proj"), n_heads, head_dim)
         dk = dk + packed_delta(x, layer.get("k_proj"), n_kv_heads, head_dim)
         dv = dv + packed_delta(x, layer.get("v_proj"), n_kv_heads, head_dim)
+        if base_weights:
+            # Weights are W, not W+ΔW: add the ΔX ΔW term on the linear maps.
+            dq = dq + packed_delta(dx, layer.get("q_proj"), n_heads, head_dim)
+            dk = dk + packed_delta(dx, layer.get("k_proj"), n_kv_heads, head_dim)
+            dv = dv + packed_delta(dx, layer.get("v_proj"), n_kv_heads, head_dim)
     dq = rope(dq)
     dk = rope(dk)
 
@@ -108,6 +114,7 @@ def mlp_first_order(
     up_w: Tensor,
     down_w: Tensor,
     layer: LayerDelta | None,
+    base_weights: bool = False,
 ) -> Tensor:
     """First-order SwiGLU: ``silu(x Wg) ⊙ (x Wu)`` then ``Wdown``."""
     g = x @ gate_w.t()
@@ -117,8 +124,12 @@ def mlp_first_order(
     if layer is not None:
         if layer.get("gate_proj") is not None:
             dg = dg + layer.get("gate_proj").apply(x)  # type: ignore[union-attr]
+            if base_weights:
+                dg = dg + layer.get("gate_proj").apply(dx)  # type: ignore[union-attr]
         if layer.get("up_proj") is not None:
             du = du + layer.get("up_proj").apply(x)  # type: ignore[union-attr]
+            if base_weights:
+                du = du + layer.get("up_proj").apply(dx)  # type: ignore[union-attr]
     h = silu(g) * u
     dh = silu_grad(g) * dg * u + silu(g) * du
     y = dh @ down_w.t()
@@ -150,6 +161,8 @@ def analytic_kv_patches(
     rope: RotaryEmbedding,
     rms_eps: float = 1e-6,
     propagator_rank: int = 64,
+    hidden_stride: int = 4,
+    base_weights: bool = False,
 ) -> tuple[dict[int, LowRankKVPatch], dict[int, Tensor]]:
     """Propagate ΔX through the stack; emit per-layer ΔKV.
 
@@ -168,6 +181,8 @@ def analytic_kv_patches(
     n_layers = weights.n_layers
 
     for l in range(n_layers):
+        if l > 0 and hidden_stride and l % max(1, int(hidden_stride)) == 0:
+            dx = dx.new_zeros(dx.shape)
         x = hidden_in[l]
         dx_layers[l] = dx
         x_n, dx_n = rmsnorm_first_order(x, dx, weights.attn_scale[l], rms_eps)
@@ -185,6 +200,7 @@ def analytic_kv_patches(
             head_dim=head_dim,
             rope=rope,
             causal_mask=causal,
+            base_weights=base_weights,
         )
         patches[l] = LowRankKVPatch(
             layer_idx=l,
@@ -208,7 +224,13 @@ def analytic_kv_patches(
         # attn(x). Use RMSNorm(x) as a cheap proxy plus dx.
         x_m, dx_m = rmsnorm_first_order(x, dx, weights.mlp_scale[l], rms_eps)
         d_mlp = mlp_first_order(
-            x_m, dx_m, weights.gate[l], weights.up[l], weights.down[l], layer
+            x_m,
+            dx_m,
+            weights.gate[l],
+            weights.up[l],
+            weights.down[l],
+            layer,
+            base_weights=base_weights,
         )
         dx = dx + d_mlp
         if propagator_rank and dx.numel() > 0:

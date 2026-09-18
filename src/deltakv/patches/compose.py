@@ -34,6 +34,27 @@ def apply_layer_patches(kv: KVCache, patches: dict[int, LowRankKVPatch]) -> KVCa
     return out
 
 
+def dense_delta_patches(base: KVCache, patched: KVCache) -> dict[int, LowRankKVPatch]:
+    """Store the full patched−base increment so chain replay does not drop stages."""
+    out: dict[int, LowRankKVPatch] = {}
+    for l in range(patched.n_layers):
+        pk, pv = patched.layer(l)
+        bk, bv = base.layer(l)
+        dk, dv = pk - bk, pv - bv
+        if float(dk.abs().max()) == 0.0 and float(dv.abs().max()) == 0.0:
+            continue
+        out[l] = LowRankKVPatch(
+            layer_idx=l,
+            k_codes=None,
+            k_basis=None,
+            v_codes=None,
+            v_basis=None,
+            k_dense=dk,
+            v_dense=dv,
+        )
+    return out
+
+
 def compose_applied(
     first: AppliedPatch,
     second: AppliedPatch,

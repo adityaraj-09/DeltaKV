@@ -19,11 +19,23 @@ from deltakv.flops import (
     prefill_flops,
     probe_flops,
 )
-from deltakv.metrics import CompareReport, attach_kl, compare_kv
+from deltakv.metrics import CompareReport, attach_quality, compare_kv
 from deltakv.model import ToyTransformer
-from deltakv.patches.analytic import attention_first_order, mlp_first_order, rmsnorm_first_order
+from deltakv.patches.analytic import (
+    attention_first_order,
+    mlp_first_order,
+    rank_truncate,
+    rmsnorm_first_order,
+)
+from deltakv.patches.anchors import (
+    cumulative_sensitivity,
+    global_probe_ratio,
+    layer_kappas,
+    plan_layers,
+)
 from deltakv.patches.compose import (
     apply_layer_patches,
+    dense_delta_patches,
     measured_error,
     should_rebase,
     within_budget,
@@ -32,7 +44,7 @@ from deltakv.patches.compose import (
 from deltakv.patches.exact import exact_kv_patch, zeroth_order_patches
 from deltakv.patches.probe import apply_probe_to_cache, select_probes, weight_axis_scores
 from deltakv.patches.tensors import AppliedPatch, CacheEntry, HiddenSnapshot, KVCache, LowRankKVPatch
-from deltakv.types import CompatibilityLevel, LookupDecision, PatchRoute, WeightVersion
+from deltakv.types import CompatibilityLevel, LayerStrategy, LookupDecision, PatchRoute, WeightVersion
 
 
 @dataclass
@@ -109,6 +121,10 @@ class DeltaKVEngine:
                     decision.estimated_flops = probe_flops(dims_, self.config.probe_ratio)
                 elif decision.route is PatchRoute.ANALYTIC:
                     decision.estimated_flops = analytic_flops(dims_, self.config.propagator_rank)
+                elif decision.route is PatchRoute.HYBRID and composed is not None:
+                    decision.estimated_flops = exact_patch_flops(dims_, composed) + 0.5 * probe_flops(
+                        dims_, self.config.probe_ratio
+                    )
                 elif composed is not None:
                     decision.estimated_flops = exact_patch_flops(dims_, composed)
                 decision.recompute_flops = prefill_flops(dims_)
@@ -168,7 +184,9 @@ class DeltaKVEngine:
         with torch.no_grad():
             fresh_logits, fresh_kv, _ = self.model.prefill(ids)
             patched_logits = self.model.logits_from_kv(ids, result.kv)
-        report = attach_kl(compare_kv(result.kv, fresh_kv), patched_logits, fresh_logits)
+        report = attach_quality(
+            compare_kv(result.kv, fresh_kv), patched_logits, fresh_logits, fresh_kv
+        )
         result.report = report
         result.decision.estimated_error.next_token_kl = report.next_token_kl
         result.decision.estimated_error.relative_kv_l2 = report.max_relative_l2
@@ -216,10 +234,16 @@ class DeltaKVEngine:
             )
             return kv, applied
 
-        if hidden is None and route in {PatchRoute.EXACT, PatchRoute.ZEROTH, PatchRoute.ANALYTIC, PatchRoute.PROBE}:
+        if hidden is None and route in {
+            PatchRoute.EXACT,
+            PatchRoute.ZEROTH,
+            PatchRoute.ANALYTIC,
+            PatchRoute.PROBE,
+            PatchRoute.HYBRID,
+        }:
             # Without hidden states we can still zeroth-order-patch using
             # reconstructed RMSNorm(embed) for layer 0 only, then probe.
-            route = PatchRoute.PROBE if route is PatchRoute.ANALYTIC else PatchRoute.ZEROTH
+            route = PatchRoute.PROBE if route in {PatchRoute.ANALYTIC, PatchRoute.HYBRID} else PatchRoute.ZEROTH
 
         if route is PatchRoute.ANALYTIC and hidden is not None:
             patches = self._analytic_patches(hidden, composed)
@@ -263,36 +287,70 @@ class DeltaKVEngine:
         kv = apply_layer_patches(current_kv, patches)
         kv.version = self.current
 
-        if route is PatchRoute.PROBE:
+        if route in {PatchRoute.PROBE, PatchRoute.HYBRID}:
             x_for_scores = (
                 self.model.blocks[0].attn_norm(hidden.layer_in(0))
                 if hidden is not None
                 else self.model.blocks[0].attn_norm(self.model.embed(ids))
             )
             scores = weight_axis_scores(x_for_scores, composed, composed.first_modified_layer)
+            cum = self._cum_kappa()
+            plans = plan_layers(
+                composed,
+                cfg.n_layers,
+                cum,
+                has_hidden=hidden is not None,
+                config=self.config,
+            )
+            ratio = (
+                self.config.probe_ratio
+                if route is PatchRoute.PROBE
+                else global_probe_ratio(plans, self.config.probe_ratio)
+            )
             probes = select_probes(
                 scores,
-                self.config.probe_ratio,
+                ratio,
                 self.config.probe_min_tokens,
                 self.config.probe_max_ratio,
             )
             fresh = self.model.recompute_probe_kv(ids, probes, kv)
-            kv, probe_patches, extra = apply_probe_to_cache(
+            probe_layers: set[int] | None
+            skip_layers: set[int] | None
+            if route is PatchRoute.PROBE:
+                probe_layers = None
+                skip_layers = None
+            else:
+                probe_layers = {
+                    l for l, p in plans.items() if p.strategy is LayerStrategy.PROBE
+                }
+                skip_layers = {
+                    l for l, p in plans.items() if p.strategy is LayerStrategy.EXACT
+                }
+            kv, _probe_patches, extra = apply_probe_to_cache(
                 kv,
                 fresh,
                 probes,
                 self.config.blend_residual_threshold,
                 self.config.blend_max_recompute_ratio,
+                layer_deltas=composed.layers,
+                subspace_rank=max(composed.max_rank, 4),
+                probe_layers=probe_layers,
+                skip_layers=skip_layers,
             )
             kv.version = self.current
-            patches = probe_patches
+            # Probe increments are relative to the zeroth-order view. Store the
+            # full patched−base delta so a later STRICT replay is exact.
+            patches = dense_delta_patches(current_kv, kv)
             err = zeroth_order_error(composed, cfg.n_layers, self.config.layer_lipschitz)
-            err.route = PatchRoute.PROBE
-            err.notes = f"probes={int(probes.numel())} extra={int(extra.numel())}"
+            err.route = route
+            err.notes = (
+                f"probes={int(probes.numel())} extra={int(extra.numel())} "
+                f"plan={{{','.join(f'{i}:{plans[i].strategy.value}' for i in sorted(plans))}}}"
+            )
             applied = AppliedPatch(
                 source=entry.current_version,
                 target=self.current,
-                route=PatchRoute.PROBE,
+                route=route,
                 layer_patches=patches,
                 error=err,
                 probe_index=probes,
@@ -326,7 +384,12 @@ class DeltaKVEngine:
         )
         dx = hidden.h[0].new_zeros(seq, cfg.d_model)
         patches: dict[int, LowRankKVPatch] = {}
+        stride = max(1, int(self.config.hidden_stride))
+        prop_r = max(1, min(int(self.config.propagator_rank), cfg.d_model, seq))
         for l, block in enumerate(self.model.blocks):
+            if l > 0 and l % stride == 0:
+                # Boundary snapshot: drop compounded ΔX and exact-patch from stored X.
+                dx = dx.new_zeros(dx.shape)
             x = hidden.layer_in(l)
             xn, dxn = rmsnorm_first_order(x, dx, block.attn_norm.weight, cfg.rms_eps)
             layer = delta.layers.get(l)
@@ -365,4 +428,11 @@ class DeltaKVEngine:
                 layer,
             )
             dx = dx + d_mlp
+            codes, basis = rank_truncate(dx, prop_r)
+            dx = codes @ basis.t()
         return patches
+
+    def _cum_kappa(self) -> list[float]:
+        ks = [b.k_proj.weight.detach() for b in self.model.blocks]
+        vs = [b.v_proj.weight.detach() for b in self.model.blocks]
+        return cumulative_sensitivity(layer_kappas(ks, vs))

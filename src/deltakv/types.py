@@ -31,8 +31,20 @@ class PatchRoute(str, Enum):
     EXACT = "exact"  # linear projections with cached activations (layer-1 / stored X)
     ZEROTH = "zeroth"  # adapter path on stale hidden states
     ANALYTIC = "analytic"  # first-order Jacobian / low-rank ΔS propagation
-    PROBE = "probe"  # AgentKVShift-style probe offset + selective recompute
+    PROBE = "probe"  # probe-anchored correction (subspace + residual μ)
+    HYBRID = "hybrid"  # per-layer mix: exact / zeroth / subspace / probe
     RECOMPUTE = "recompute"
+
+
+class LayerStrategy(str, Enum):
+    """Per-layer patch plan used by the hybrid router."""
+
+    SKIP = "skip"
+    EXACT = "exact"
+    ZEROTH = "zeroth"
+    SUBSPACE = "subspace"
+    PROBE = "probe"
+    ANALYTIC = "analytic"
 
 
 @dataclass(frozen=True)

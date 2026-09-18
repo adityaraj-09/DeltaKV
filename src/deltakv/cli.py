@@ -74,7 +74,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     pat = exact_patch_flops(dims, delta)
     print(f"FLOPs  re-prefill={rec:.0f}  exact/zeroth patch={pat:.0f}  ratio={pat / rec:.4f}")
 
-    for route in ("zeroth", "analytic", "probe"):
+    for route in ("zeroth", "analytic", "probe", "hybrid"):
         # Fresh engine state per route: restore store by re-prefill under OLD
         # weights. Easier: evaluate_against_fresh uses current (new) weights
         # and the cached old KV still in the store.
@@ -82,10 +82,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
         r = result.report
         assert r is not None
         kl = f"{r.next_token_kl:.4e}" if r.next_token_kl is not None else "n/a"
+        lp = f"{r.logprob_mae:.4e}" if r.logprob_mae is not None else "n/a"
+        kivi = f"{r.kivi4_floor:.4f}" if r.kivi4_floor is not None else "n/a"
         print(
             f"  route={route:10s}  decision={result.decision.level.value:8s}  "
-            f"maxRelL2={r.max_relative_l2:.4f}  minCos={r.min_cosine:.4f}  KL={kl}  "
-            f"flop_ratio={result.decision.flop_ratio:.4f}"
+            f"maxRelL2={r.max_relative_l2:.4f}  minCos={r.min_cosine:.4f}  "
+            f"KL={kl}  logprobMAE={lp}  kivi4={kivi}  "
+            f"withinKIVI={r.within_kivi4}  flop_ratio={result.decision.flop_ratio:.4f}"
         )
         # After probe/analytic the chain is dirty; reset by dropping and
         # re-prefilling under *old* weights would require revert. For the
@@ -97,7 +100,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         engine.prefill(tokens)
         engine.commit_delta(delta)
 
-    print("kill criterion: patched-KV KL ≲ 1e-2 nats and mid-depth rel L2 ≲ 0.10")
+    print("kill criterion: patched-KV KL ≲ 1e-2 nats, mid-depth rel L2 ≲ 0.10, and maxRelL2 ≲ KIVI-4bit floor")
     return 0
 
 
@@ -127,6 +130,7 @@ def cmd_demo(_args: argparse.Namespace) -> int:
     print("ROME edit demo")
     print(f"  level={result.decision.level.value} route={result.decision.route.value}")
     print(f"  maxRelL2={r.max_relative_l2:.4f} KL={r.next_token_kl:.4e}")
+    print(f"  logprobMAE={r.logprob_mae:.4e} kivi4={r.kivi4_floor:.4f} withinKIVI={r.within_kivi4}")
     print(f"  reason={result.decision.reason}")
     return 0
 

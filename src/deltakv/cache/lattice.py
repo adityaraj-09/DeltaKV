@@ -136,19 +136,19 @@ class CompatibilityLattice:
                 "zeroth": (PatchRoute.ZEROTH, exact_cost),
                 "analytic": (PatchRoute.ANALYTIC, analytic_cost),
                 "probe": (PatchRoute.PROBE, probe_cost),
+                "hybrid": (PatchRoute.HYBRID, exact_cost + 0.5 * probe_cost),
             }
-            return mapping.get(preferred, (PatchRoute.ZEROTH, exact_cost))
+            return mapping.get(preferred, (PatchRoute.HYBRID, exact_cost + 0.5 * probe_cost))
 
-        # Auto: exact/zeroth (same FLOPs — adapter path) if we have hidden
-        # states or only the first layer moved; else probe if cheaper than
-        # analytic; never pick a route more expensive than recompute.
         rec = prefill_flops(dims)
+        hybrid_cost = exact_cost + 0.5 * probe_cost
         candidates: list[tuple[PatchRoute, float]] = [
+            (PatchRoute.HYBRID, hybrid_cost),
             (PatchRoute.ZEROTH, exact_cost),
+            (PatchRoute.PROBE, probe_cost),
         ]
         if has_hidden:
             candidates.append((PatchRoute.ANALYTIC, analytic_cost))
-        candidates.append((PatchRoute.PROBE, probe_cost))
         route, cost = min(candidates, key=lambda kv: kv[1])
         if cost >= rec:
             return PatchRoute.RECOMPUTE, rec

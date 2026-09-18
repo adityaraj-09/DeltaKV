@@ -14,7 +14,7 @@ A **product-shaped library**, not a paper sketch:
 
 | Piece | Role |
 |---|---|
-| Core math | Exact layer-1 / projection patches, low-rank compressed ΔKV, first-order analytic propagation, AgentKVShift-style probe correction, CacheBlend residual gate |
+| Core math | Exact projection patches, rank-r LoRA-subspace correction, LoRC κ-anchored hybrid routing, first-order analytic ΔX (stride reset + rank-truncate), CacheBlend residual gate |
 | Cache contract | Entries are `(base_kv, patch_chain, error_estimate)`. Compatibility lattice: `strict → patched-ε → miss` |
 | Toy reference engine | Real Llama-style stack (RMSNorm, RoPE, GQA, SwiGLU) that prefills, patches, decodes, and scores KL against a fresh prefill — on CPU, in tests |
 | Connectors | **vLLM** `KVConnectorBase_V1` plugin, **SGLang** `update_weights_*` hook, **LMCache HiddenStateStore** adapter for Route A, **HuggingFace/PEFT** LoRA extractor |
@@ -44,8 +44,8 @@ engine.prefill(tokens)                     # cache under W0
 # rank-r LoRA on k/v of every layer — the production LoRA-swap case
 ...
 engine.commit_delta(delta)                 # does NOT flush
-result = engine.evaluate_against_fresh(tokens, route="probe")
-print(result.report.as_dict())             # rel L2, cosine, next-token KL
+result = engine.evaluate_against_fresh(tokens, route="hybrid")
+print(result.report.as_dict())             # rel L2, KL, logprob MAE, KIVI-4bit floor
 ```
 
 If patched-KV next-token KL stays under ~10⁻² nats, the idea is alive. If error explodes by mid-depth even for tiny ΔW, the budget forces a recompute — you cannot do worse than today.
@@ -53,9 +53,10 @@ If patched-KV next-token KL stays under ~10⁻² nats, the idea is alive. If err
 On the CPU toy (4 layers, d=64, seq=64, rank-4 LoRA, scale=0.01) the validator already clears that bar:
 
 ```
-route=zeroth    patched  maxRelL2=0.0035  KL≈0     flop_ratio=0.034
-route=analytic  patched  maxRelL2≈0       KL≈0     flop_ratio ~ analytic
-route=probe     patched  maxRelL2=0.0024  KL≈0     flop_ratio ~ 0.10×prefill + add
+route=zeroth    patched  maxRelL2≈0.0035  KL≈0  within KIVI-4bit
+route=analytic  patched  maxRelL2≈0       KL≈0
+route=probe     patched  maxRelL2≈0.0024  KL≈0  flop_ratio ~ 0.10×prefill
+route=hybrid    patched  per-layer exact / subspace / probe  (default)
 ```
 
 ```bash
@@ -82,11 +83,13 @@ See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the exact vLLM / SGLang / LMC
 
 On a cache hit under a new weight version the engine materializes a *patched view*:
 
-1. **Exact / zeroth-order** — run the adapter path on cached activations. Exact at any layer whose input X is stored (layer 1 always, if embeddings are frozen). `O(n·d·r)` vs `O(n·d²)` re-prefill. For rank-r LoRA the patch itself compresses ~`d/r`× (64× at d=4096, r=64).
-2. **Analytic (Route A)** — first-order Jacobians of attention (softmax) and SwiGLU, using LMCache-style hidden snapshots. Cheap when ΔK/ΔQ/ΔV are low-rank.
-3. **Probe (Route B)** — recompute 5–15% of tokens under the new weights, estimate the chunk-level KV offset, shift the rest (AgentKVShift). High-residual tokens fall back to full recompute (CacheBlend).
+1. **Exact / zeroth-order** — adapter path on cached activations. Exact at any layer whose input X is stored. `O(n·d·r)` vs `O(n·d²)` re-prefill.
+2. **Subspace** — rank-r least-squares onto LoRA `B` plus an orthogonal residual μ. Generalizes AgentKVShift's rank-1 mean-shift to the actual column space of ΔW.
+3. **Analytic (Route A)** — first-order Jacobians of attention (softmax) and SwiGLU, with `ΔX` reset every `hidden_stride` layers and rank-truncated between blocks.
+4. **Probe (Route B)** — recompute a κ-weighted slice of tokens, apply the subspace shift, residual-gate outliers (CacheBlend).
+5. **Hybrid (default)** — per-layer mix of the above, planned from cumulative condition numbers `κ̃_ℓ`. Boundary layers with stored X go exact; high-`κ̃` layers get probes; the rest get subspace.
 
-A cost-based scheduler picks the cheapest route that fits ε. Exceeding ε is a **miss**: flush-and-recompute, which is exactly today's behavior.
+A cost-based scheduler picks the cheapest route that fits ε. Exceeding ε is a **miss**: flush-and-recompute, which is exactly today's behavior. Quality is scored with next-token KL, logprob L1, and a KIVI-4bit noise floor — not KV-L2 alone.
 
 ## Status
 

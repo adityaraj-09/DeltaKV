@@ -7,6 +7,7 @@ from torch import Tensor
 
 from deltakv.deltas.descriptor import WeightDelta
 from deltakv.patches.exact import lora_activation_scores
+from deltakv.patches.subspace import bases_for_layer, subspace_correct
 from deltakv.patches.tensors import KVCache, LowRankKVPatch
 
 
@@ -114,19 +115,39 @@ def apply_probe_to_cache(
     probe_index: Tensor,
     blend_threshold: float = 0.15,
     blend_max_ratio: float = 0.40,
+    *,
+    layer_deltas: dict | None = None,
+    subspace_rank: int = 8,
+    probe_layers: set[int] | None = None,
+    skip_layers: set[int] | None = None,
 ) -> tuple[KVCache, dict[int, LowRankKVPatch], Tensor]:
-    """Correct every layer of ``kv`` in-place-copy using per-layer probe offsets."""
+    """Correct cached KV using a rank-r subspace shift + residual μ.
+
+    ``layer_deltas`` maps layer index → ``LayerDelta`` so V can use LoRA ``B``
+    as the exact column-space basis. K is RoPE'd, so its basis is the SVD of
+    the probe residual. Layers in ``probe_layers`` also run the CacheBlend
+    residual gate; ``None`` gates every layer (legacy probe route).
+    ``skip_layers`` keep the incoming KV (exact projection patches).
+    """
     out = kv.clone()
     patches: dict[int, LowRankKVPatch] = {}
     extra_all: list[Tensor] = []
     for l, (fk, fv) in fresh_layers.items():
+        if skip_layers is not None and l in skip_layers:
+            continue
         rk, rv = out.layer(l)
-        k_c, v_c, _, _ = probe_offset_correct(rk, rv, fk, fv, probe_index)
-        extra = residual_gate(rk, k_c, fk, probe_index, blend_threshold, blend_max_ratio)
-        if extra.numel():
-            k_c[extra] = fk[extra]
-            v_c[extra] = fv[extra]
-            extra_all.append(extra)
+        layer = None if layer_deltas is None else layer_deltas.get(l)
+        k_b, v_b = bases_for_layer(layer)
+        k_rank = int(k_b.shape[1]) if k_b is not None else subspace_rank
+        k_c, _, _ = subspace_correct(rk, fk, probe_index, basis=None, rank=k_rank)
+        v_c, _, _ = subspace_correct(rv, fv, probe_index, basis=v_b, rank=subspace_rank)
+        gated = probe_layers is None or l in probe_layers
+        if gated:
+            extra = residual_gate(rk, k_c, fk, probe_index, blend_threshold, blend_max_ratio)
+            if extra.numel():
+                k_c[extra] = fk[extra]
+                v_c[extra] = fv[extra]
+                extra_all.append(extra)
         out.k[l] = k_c
         out.v[l] = v_c
         patches[l] = LowRankKVPatch(

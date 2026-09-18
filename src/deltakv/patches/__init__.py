@@ -6,9 +6,18 @@ from deltakv.patches.analytic import (
     rank_truncate,
     rmsnorm_first_order,
 )
+from deltakv.patches.anchors import (
+    cumulative_sensitivity,
+    global_probe_ratio,
+    layer_kappas,
+    plan_layers,
+    probe_ratio_schedule,
+    spectral_condition,
+)
 from deltakv.patches.compose import (
     apply_layer_patches,
     compose_applied,
+    dense_delta_patches,
     measured_error,
     should_rebase,
     within_budget,
@@ -21,6 +30,7 @@ from deltakv.patches.probe import (
     select_probes,
     weight_axis_scores,
 )
+from deltakv.patches.subspace import subspace_correct
 from deltakv.patches.tensors import (
     AppliedPatch,
     CacheEntry,
@@ -41,15 +51,23 @@ __all__ = [
     "apply_probe_to_cache",
     "attention_first_order",
     "compose_applied",
+    "cumulative_sensitivity",
+    "dense_delta_patches",
     "exact_kv_patch",
+    "global_probe_ratio",
+    "layer_kappas",
     "lora_activation_scores",
     "measured_error",
     "mlp_first_order",
+    "plan_layers",
     "probe_offset_correct",
+    "probe_ratio_schedule",
     "rank_truncate",
     "rmsnorm_first_order",
     "select_probes",
     "should_rebase",
+    "spectral_condition",
+    "subspace_correct",
     "weight_axis_scores",
     "within_budget",
     "zeroth_order_error",

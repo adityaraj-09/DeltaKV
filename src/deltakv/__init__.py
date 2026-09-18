@@ -16,13 +16,21 @@ from deltakv.deltas import (
     rome_delta,
 )
 from deltakv.engine import DeltaKVEngine, MaintainResult
-from deltakv.metrics import CompareReport, compare_kv, next_token_kl
+from deltakv.metrics import (
+    CompareReport,
+    attach_quality,
+    compare_kv,
+    kivi_noise_floor,
+    logprob_error,
+    next_token_kl,
+)
 from deltakv.model import ToyConfig, ToyTransformer
 from deltakv.types import (
     CompatibilityLevel,
     DeltaKind,
     ErrorBudget,
     ErrorEstimate,
+    LayerStrategy,
     LookupDecision,
     PatchRoute,
     WeightVersion,
@@ -39,6 +47,7 @@ __all__ = [
     "ErrorBudget",
     "ErrorEstimate",
     "LayerDelta",
+    "LayerStrategy",
     "LookupDecision",
     "LowRankFactors",
     "MaintainResult",
@@ -48,7 +57,10 @@ __all__ = [
     "WeightDelta",
     "WeightVersion",
     "adapter_swap",
+    "attach_quality",
     "compare_kv",
+    "kivi_noise_floor",
+    "logprob_error",
     "compose_deltas",
     "from_peft_state_dict",
     "lora_delta",
