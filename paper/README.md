@@ -1,20 +1,14 @@
-# ICLR-style paper
+# Papers
 
-LaTeX source for the ΔKV paper, using the official ICLR conference style
-(vendored from the [ICLR Master Template](https://github.com/ICLR/Master-Template),
-retargeted to ICLR 2027).
+| Layout | Path | Look |
+|---|---|---|
+| ICLR conference | [`paper/`](.) | Double-blind, side ruler, 5.5in column |
+| arXiv preprint | [`paper/arxiv/`](arxiv/) | Named author, “A Preprint” header, 6.5in column |
 
 ```bash
-cd paper
-pdflatex main
-bibtex main
-pdflatex main
-pdflatex main
+cd paper && make          # ICLR
+cd paper/arxiv && make    # arXiv
 ```
 
-Or: `make` in this directory.
+Numbers in both PDFs are from `python -m deltakv bench --seq 64 --rank 4 --scale 0.01`.
 
-The compiled PDF is a double-blind ICLR submission: anonymous authors,
-side ruler, running header *Under review as a conference paper at ICLR 2027*.
-A prebuilt `main.pdf` is in this folder. Numbers in Table 1 are from
-`python -m deltakv bench --seq 64 --rank 4 --scale 0.01`.

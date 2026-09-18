@@ -1,0 +1,668 @@
+\documentclass{article}
+
+\usepackage{arxiv}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{natbib}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\title{$\Delta$KV: Patching the KV Cache When Weights Change}
+
+\author{
+  Aditya Raj \\
+  \texttt{itsrishabhforyou@gmail.com}
+}
+
+\date{\today}
+
+\renewcommand{\shorttitle}{$\Delta$KV: Weight-Delta-Aware KV Cache}
+\renewcommand{\headeright}{A Preprint}
+\renewcommand{\undertitle}{A Preprint}
+
+\newcommand{\dkv}{$\Delta$KV}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Every production LLM serving stack treats a weight update as a cache miss.
+vLLM namespaces prefix blocks by LoRA name, SGLang isolates by
+\texttt{weight\_version}, and RL trainers flush every KV byte on every
+policy step. The universal algorithm is: \emph{weights changed $\to$ throw
+away all computed state $\to$ recompute from scratch.}
+We argue this is the wrong primitive.
+The KV cache is a materialized view over $(\mathrm{weights}\times\mathrm{tokens})$;
+a weight update should trigger incremental view maintenance, not invalidation.
+This preprint describes \dkv, a library that, given a compact $\Delta W$
+(LoRA swap, ROME edit, quantization change, or KL-bounded RL step),
+computes the corresponding $\Delta$KV at a fraction of re-prefill cost.
+Cache keys are token prefixes only: adapter identity and weight version
+are edges in a lineage graph, not part of the key.
+At any layer whose input activations are stored, the projection patch
+$\Delta K=\mathrm{RoPE}(X\Delta W_K^\top)$, $\Delta V=X\Delta W_V^\top$ is
+\emph{exact} because RoPE is linear.
+Deeper layers are maintained by a hybrid of the adapter path on cached
+hidden states, rank-$r$ least-squares onto the LoRA column space, first-order
+Jacobian propagation of $\Delta X$ with snapshot resets, and a
+condition-number--anchored probe budget.
+A compatibility lattice $\mathrm{strict}\to\mathrm{patched}\text{-}\varepsilon\to\mathrm{miss}$
+makes the system pointwise never worse than today's flush-and-recompute.
+On a CPU Llama-style reference stack, a rank-4 LoRA of scale $10^{-2}$ is
+patched with next-token KL $\approx 0$, relative KV $\ell_2\approx 2\times 10^{-3}$
+(inside a 4-bit KIVI noise floor), and $8.5\%$ of re-prefill FLOPs.
+\dkv\ does not fork vLLM or SGLang; it plugs into the connectors those
+engines already expose.
+\end{abstract}
+
+\keywords{KV cache \and LoRA \and LLM serving \and incremental view maintenance \and vLLM \and SGLang}
+
+\section{Introduction}
+\label{sec:intro}
+
+Prefix caching is the main reason LLM serving is fast.
+vLLM's paged attention~\citep{kwon2023vllm} and SGLang's radix
+tree~\citep{zheng2024sglang} reuse KV for shared token prefixes across
+requests, LoRA adapters, and RL rollouts.
+That reuse has two well-understood axes: \emph{tokens} (the prefix) and
+\emph{position} (RoPE;~\citealp{su2024rope}).
+A third axis is almost always ignored: \emph{the weights}.
+
+Whenever the weights move---loading a LoRA~\citep{hu2022lora}, swapping
+adapters, applying a ROME write~\citep{meng2022rome}, changing a
+quantization grid, or taking a PPO/GRPO step---today's engines declare the
+entire KV cache invalid.
+vLLM hashes \texttt{lora\_name} into the prefix-block key and, on a
+same-name reload, silently reuses stale
+blocks.\footnote{\url{https://github.com/vllm-project/vllm/issues/42125};
+RFC \url{https://github.com/vllm-project/vllm/issues/48312}.}
+SGLang puts \texttt{weight\_version} in the radix
+\texttt{extra\_key}~\citep{sglang-weight-version} and flushes HiCache on
+every update.
+veRL and Mooncake hard-reset every KV byte on every policy step.
+The result is that the most expensive tensor in the system is thrown away
+the moment it becomes slightly wrong, even when $\Delta W$ is
+\emph{small by construction} (rank-$r$ LoRA, rank-1 edit, KL-bounded RL).
+
+This paper makes a simple claim:
+\textbf{KV is a materialized view over $(\mathrm{weights}\times\mathrm{tokens})$;
+$\Delta$KV is incremental view maintenance under weight updates.}
+Database engines have done this for decades~\citep{gupta1993ivm}.
+Serving engines have not, because they treat the cache as an opaque byte
+buffer keyed by a hash that includes the weight identity.
+
+We introduce \dkv, a product-shaped library that replaces invalidation with
+maintenance.
+A weight update ships a compact \emph{delta descriptor} (PEFT factors,
+a ROME outer product, or an SVD sketch).
+The next lookup of a cached prefix materializes a \emph{patched view}
+instead of missing.
+If a conservative error estimate exceeds a budget $\varepsilon$, the
+engine does exactly what it does today: recompute.
+You cannot do worse than flush.
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{A cache contract} in which keys are token prefixes only and
+compatibility is a lattice
+$\mathrm{strict}\to\mathrm{patched}\text{-}\varepsilon\to\mathrm{miss}$
+(\S\ref{sec:contract}).
+\item \textbf{Exact projection patches.}
+Because RoPE is linear,
+$\mathrm{RoPE}(K+\Delta K)=\mathrm{RoPE}(K)+\mathrm{RoPE}(\Delta K)$.
+At any layer whose input $X$ is stored, $\Delta K$ and $\Delta V$ are
+closed-form and numerically exact (\S\ref{sec:exact}).
+\item \textbf{A rank-$r$ LoRA-subspace corrector} that generalizes a
+rank-1 mean-shift $\mu$ to the column space of $B$, with an orthogonal
+residual and a CacheBlend-style residual gate~\citep{yao2024cacheblend}
+(\S\ref{sec:subspace}).
+\item \textbf{LoRC-style $\kappa$-anchored hybrid routing}: per-layer
+skip / exact / subspace / probe planned from cumulative condition
+numbers, plus first-order $\Delta X$ propagation with snapshot
+resets (\S\ref{sec:hybrid}--\S\ref{sec:analytic}).
+\item \textbf{Connectors, not forks}: vLLM \texttt{KVConnectorBase\_V1},
+SGLang \texttt{update\_weights\_*}, LMCache HiddenStateStore, PEFT
+state-dict extraction (\S\ref{sec:systems}).
+\item \textbf{A kill-criterion validator} on a real Llama-style stack
+(RMSNorm, RoPE, GQA, SwiGLU) that reports next-token KL, log-prob
+$L_1$, and a KIVI-4bit floor---not KV-$\ell_2$ alone (\S\ref{sec:exp}).
+\end{enumerate}
+
+This document is an arXiv-style preprint of the same technical claim as
+the companion ICLR-formatted note in \texttt{paper/}.
+The algorithm, numbers, and limitations are identical; the layout follows
+the Kour arXiv style (Times, wide single column, ``A Preprint'' running
+header) rather than the ICLR conference class.
+
+\section{Setup and cache contract}
+\label{sec:contract}
+
+A decoder-only Transformer~\citep{touvron2023llama} maps a token prefix
+$x_{1:n}$ and weights $W$ to a KV cache
+$C=\mathrm{KV}(W,x_{1:n})\in\mathbb{R}^{L\times n\times n_{\mathrm{kv}}\times d_h}$
+and a next-token distribution $\pi(\cdot\mid x_{1:n};W,C)$.
+A \emph{weight version} $v$ is a node in a lineage DAG.
+A \emph{weight delta} $\Delta W_{v\to v'}$ is a compact descriptor of
+$W_{v'}-W_v$ (\S\ref{sec:delta}).
+The serving question is: given $C$ computed under $v$, produce a cache
+$C'$ that is a valid view under $v'$ \emph{without} running a full prefill.
+
+\paragraph{Entry.}
+A cache row is
+\begin{equation}
+  \mathrm{CacheEntry}\;=\;
+  \bigl(\underbrace{C_{\mathrm{base}}}_{\text{KV under }v_0},\;
+        \underbrace{(\Delta C_i)_i}_{\text{patch chain}},\;
+        \underbrace{\hat\varepsilon}_{\text{error estimate}}\bigr).
+\end{equation}
+The physical key is $\mathrm{hash}(x_{1:n})$---tokens only.
+Adapter name and weight version are \emph{not} in the key; they label
+edges of the lineage graph.
+This is the opposite of vLLM's \texttt{lora\_name} extra hash and
+SGLang's \texttt{weight\_version} radix namespace.
+
+\paragraph{Lookup lattice.}
+\begin{equation}
+  \mathrm{lookup}(x_{1:n},W_{\mathrm{cur}}) \;=\;
+  \begin{cases}
+    \mathrm{STRICT}  & \text{if } v(C)=v_{\mathrm{cur}},\\
+    \mathrm{PATCHED} & \text{if a }\Delta W\text{ path exists and }\hat\varepsilon\le\varepsilon,\\
+    \mathrm{MISS}    & \text{otherwise (today's recompute).}
+  \end{cases}
+\end{equation}
+\dkv\ is \emph{pointwise never worse} than vLLM/SGLang today:
+a miss is exactly flush-and-recompute, and a patch whose measured residual
+exceeds $\varepsilon$ is promoted to a miss (the \emph{correctness floor}).
+
+\paragraph{Kill criterion.}
+A patched cache is acceptable if
+(i)~next-token $\mathrm{KL}(\pi_{\mathrm{fresh}}\,\|\,\pi_{\mathrm{patched}})\lesssim 10^{-2}$~nats,
+(ii)~max-layer relative KV $\ell_2\lesssim 0.10$, and
+(iii)~that $\ell_2$ sits inside a 4-bit grouped-quantization noise floor
+(KIVI;~\citealp{liu2024kivi}).
+KV-$\ell_2$ alone is the wrong metric for serving and RL: sampling cares
+about $\pi$, and TIS/PPO care about $|\log\pi_{\mathrm{fresh}}-\log\pi_{\mathrm{patched}}|$.
+
+\section{Delta descriptors}
+\label{sec:delta}
+
+A weight update ships kilobytes, not a checkpoint.
+
+\begin{table}[h]
+\centering
+\caption{Compact $\Delta W$ payloads. PEFT convention throughout:
+$y=xW^\top + s\,(xA^\top)B^\top$, so per-token $\Delta y$ lives in
+$\mathrm{col}(B)$.}
+\label{tab:delta}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Regime & Payload & Rank \\
+\midrule
+LoRA / adapter swap & PEFT $A\in\mathbb{R}^{r\times\mathrm{in}}$, $B\in\mathbb{R}^{\mathrm{out}\times r}$, $s=\alpha/r$
+  & $r$ (swap: $r_1+r_2$) \\
+ROME / MEMIT & outer product $uv^\top$ & $1$ \\
+Quant swap & SVD sketch of $W_{q_{\mathrm{new}}}-W_{q_{\mathrm{old}}}$ & chosen $r$ \\
+RL step & SVD sketch of a KL-bounded $\Delta W$ & chosen $r$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Adapter swap is subtraction in factor space:
+$\Delta W_{A\to B}=\Delta W_B-\Delta W_A$, implemented by concatenating
+factors with a sign flip (rank adds).
+Quant and RL deltas that arrive dense are compressed once with an economy
+SVD to rank $r$ and then treated identically to LoRA.
+
+The \emph{patchable regime} is the set of $\Delta W$ that are small by
+construction.
+If a Frobenius proxy $\|\Delta W\|$ exceeds a threshold
+(default $0.5$), \dkv\ refuses to patch: full SFT, architecture swaps,
+and other large moves are a miss.
+This is a feature, not a limitation---the lattice is allowed to say no.
+
+\section{Exact projection patches}
+\label{sec:exact}
+
+Let $X\in\mathbb{R}^{n\times d}$ be the (RMSNorm'd) input of a
+$k$/$v$ projection, and let $\Delta W_K,\Delta W_V$ be the corresponding
+maps.
+Then
+\begin{equation}
+  \label{eq:exact}
+  \Delta K \;=\; \mathrm{RoPE}\!\bigl(X\Delta W_K^\top\bigr),\qquad
+  \Delta V \;=\; X\Delta W_V^\top.
+\end{equation}
+RoPE is a block-diagonal linear operator on each $(2i,2i{+}1)$ pair, so
+\begin{equation}
+  \mathrm{RoPE}(K+\Delta K)\;=\;\mathrm{RoPE}(K)+\mathrm{RoPE}(\Delta K).
+\end{equation}
+Equation~\eqref{eq:exact} is therefore \emph{algebraically exact} at any
+layer whose $X$ is the true input under the \emph{new} weights---in
+particular layer~$0$ when embeddings are frozen, and every layer whose
+residual-stream snapshot is stored (LMCache HiddenStateStore).
+For LoRA this is literally the adapter path, $O(ndr)$ vs.\ $O(nd^2)$ for
+the dense projection, and storage is $nr+rd$ codes+basis until RoPE mixes
+the $K$ basis (after which we keep a dense increment of size
+$n\,d_{\mathrm{kv}}$---still one layer, still not a re-prefill).
+
+On the reference stack, layer-0 $K$/$V$ after~\eqref{eq:exact} matches a
+fresh prefill to $2{\times}10^{-5}$ absolute error
+(\S\ref{sec:exp}).
+
+Above the first modified layer, $X_\ell$ itself depends on $W$, so
+\eqref{eq:exact} on a \emph{stale} $X_\ell$ is a zeroth-order
+approximation---cheap, and the baseline every other route corrects.
+
+\section{Deep-layer routes}
+\label{sec:deep}
+
+\subsection{Rank-\texorpdfstring{$r$}{r} subspace correction}
+\label{sec:subspace}
+
+A common probe corrector estimates a chunk-level offset $\hat\mu$ from a
+handful of recomputed tokens and adds it to everyone else.
+That is the rank-1 special case.
+Production LoRA is rank-$r$: $\Delta V$ lives in $\mathrm{col}(B)$.
+Let $R = C_{\mathrm{fresh}}-C_{\mathrm{reused}}\in\mathbb{R}^{n\times d_{\mathrm{kv}}}$
+be a residual estimate (exact on probes; mixed-forward on the rest) and
+$B\in\mathbb{R}^{d_{\mathrm{kv}}\times r}$ the LoRA $B$ of $v_{\mathrm{proj}}$.
+\dkv\ solves, per token,
+\begin{equation}
+  \label{eq:ls}
+  c_j \;=\; \arg\min_{c}\; \bigl\| R_{j,:} - B c \bigr\|_2^2
+  \;=\; (B^\top B+\lambda I)^{-1} B^\top R_{j,:}^\top,
+\end{equation}
+applies the structured increment $c_j^\top B^\top$, and mean-shifts only
+the leftover orthogonal to $\mathrm{col}(B)$, estimated on probes:
+\begin{equation}
+  \mu_\perp \;=\; \frac{1}{|{\mathcal P}|}\sum_{j\in{\mathcal P}}
+  \bigl(R_{j,:}-c_j^\top B^\top\bigr).
+\end{equation}
+Probes are overwritten with fresh values.
+Tokens whose residual still looks large relative to the probe scale are
+fully recomputed (CacheBlend residual gate).
+
+After RoPE, $\Delta K$ is \emph{not} in $\mathrm{col}(B)$: rotation mixes
+coordinates per position.
+For $K$ we therefore take the leading-$r$ right singular vectors of the
+probe residual as the basis, at the same rank as the adapter.
+
+The quality win over a scalar $\mu$ is per-token codes in the true
+column space of $\Delta W$, not a collapse to rank~$1$.
+
+\subsection{First-order analytic propagation}
+\label{sec:analytic}
+
+When boundary activations $h_{\mathrm{in}},h_{\mathrm{mid}}$ are stored,
+\dkv\ propagates $\Delta X$ with closed-form Jacobians
+(Appendix~\ref{app:jac}):
+\begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+\item \textbf{RMSNorm.}
+$y = x/{\mathrm{rms}}\cdot w$;
+$\mathrm{d}y$ follows by differentiating $\mathrm{rms}=\sqrt{\mathrm{mean}(x^2)+\epsilon}$.
+\item \textbf{Attention.}
+$\Delta S = (\Delta Q\,K^\top + Q\,\Delta K^\top)/\sqrt{d_h}$,
+$\Delta A = J_{\mathrm{softmax}}(A)[\Delta S]$ with the exact row-wise
+map $a\odot(\delta-\langle a,\delta\rangle)$,
+$\Delta\mathrm{ctx}=\Delta A\,V + A\,\Delta V$.
+\item \textbf{SwiGLU.}
+$\mathrm{d}(\mathrm{silu}(g)\odot u)
+ = (\mathrm{silu}'(g)\odot\mathrm{d}g)\odot u + \mathrm{silu}(g)\odot\mathrm{d}u$.
+\end{itemize}
+Two stabilizers keep first-order error from compounding:
+(i)~$\Delta X$ is rank-truncated to \texttt{propagator\_rank} after every
+layer;
+(ii)~$\Delta X$ is \emph{reset to $0$} every \texttt{hidden\_stride}
+layers (default $4$), after which that layer is exact-patched from the
+stored snapshot.
+The engine commits $\Delta W$ \emph{before} propagating, so
+$\mathrm{d}x\,{W'}^\top$ already contains the second-order
+$\Delta X\Delta W$ term.
+
+When $\Delta Q,\Delta K,\Delta V$ are rank-$r$, forming $\Delta S$ is
+$O(n^2 r)$ not $O(n^2 d)$~\citep{dao2022flashattention}.
+On short sequences the dense softmax Jacobian still dominates, which is
+why analytic is accurate but not always cheaper than prefill
+(\S\ref{sec:exp})---a kernel, not a math, gap.
+
+\subsection{\texorpdfstring{$\kappa$}{k}-anchored hybrid routing}
+\label{sec:hybrid}
+
+Not every layer deserves the same work.
+Let $\kappa_\ell=\kappa(W_K^{(\ell)})\,\kappa(W_V^{(\ell)})$ with
+$\kappa(W)=\sigma_{\max}/\sigma_{\min}$, and define the reverse cumulative
+\begin{equation}
+  \tilde\kappa_\ell \;=\; \prod_{j=\ell}^{L-1} \kappa_j.
+\end{equation}
+Shallow errors are amplified more.
+A log-normalized $\tilde\kappa$ plus a depth prior yields a
+\emph{progressive probe budget}: the first third of the stack and
+high-$\tilde\kappa$ layers get up to $20\%$ probes; deep, well-conditioned
+layers get $5\%$.
+The per-layer plan is then:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Condition & Strategy \\
+\midrule
+No local $\Delta W$ and no upstream $\Delta W$ & skip \\
+No local $\Delta W$, upstream $\Delta X$ exists & subspace (correct $\Delta X$-induced KV drift) \\
+Stored $X$ at layer $0$ / every stride, $k$/$v$ $\Delta W$ & exact, \eqref{eq:exact} \\
+Normalized $\tilde\kappa\ge 0.65$ & probe (subspace $+$ residual gate) \\
+Otherwise & subspace (rank-$r$ shift, no extra blend) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The default route is \textbf{hybrid}.
+Probe / hybrid patches are stored as the \emph{full} patched-minus-base
+increment so a later \texttt{STRICT} replay does not drop the zeroth-order
+stage.
+
+\subsection{Error accounting and cost}
+\label{sec:cost}
+
+Zeroth-order carries a Lipschitz compound bound so we never under-report:
+layer error is $e_{\ell}=L_{\mathrm{lip}}\,e_{\ell-1}+\|\Delta W_\ell\|$ with
+$L_{\mathrm{lip}}=1.2$ by default.
+Probe and analytic may replace it with a measured residual.
+Chains add errors conservatively and rebase (rewrite the prefix as a new
+base) when $\hat\varepsilon\ge 0.8\,\varepsilon$.
+
+Approximate FLOPs:
+\begin{align}
+  c_{\mathrm{prefill}} &\approx L\bigl(nd^2 + n^2 d + nd\,d_{\mathrm{ff}}\bigr),\\
+  c_{\mathrm{exact}}   &\approx (\#\text{LoRA maps})\cdot ndr,\\
+  c_{\mathrm{probe}}   &\approx \rho\, c_{\mathrm{prefill}} + Lnd,\\
+  c_{\mathrm{hybrid}}  &\approx c_{\mathrm{exact}} + \tfrac12 c_{\mathrm{probe}},\\
+  c_{\mathrm{analytic}}&\approx L(ndr + n^2 r).
+\end{align}
+The scheduler will not pick an \texttt{auto} route whose FLOPs exceed
+re-prefill.
+Combined with the $\varepsilon$ floor, the engine is never more expensive
+\emph{and} never less correct, pointwise, than flush.
+
+\section{Systems integration}
+\label{sec:systems}
+
+\dkv\ is a library.
+The serving engines stay the serving engines.
+
+\paragraph{vLLM.}
+V1 loads external connectors from
+\texttt{kv\_connector\_module\_path}.
+\texttt{DeltaKVConnector} duck-types \texttt{KVConnectorBase\_V1}.
+On \texttt{load\_lora\_adapter} / RL weight broadcast the connector
+registers a $\Delta W$ instead of bumping a generation counter.
+It looks up the token-only prefix, materializes a patched view, and
+scatters it into already-allocated paged blocks
+$[N_{\mathrm{blocks}},\mathrm{block\_size},n_{\mathrm{kv}},d_h]$.
+If $\varepsilon$ is exceeded, \texttt{get\_num\_new\_matched\_tokens}
+returns $0$ and vLLM prefills.
+The remaining upstream one-liner is: stop putting \texttt{lora\_name} in
+the block hash when this connector is installed.
+
+\paragraph{SGLang.}
+Leave \texttt{--enable-weight-version-kv-isolation} off.
+Wrap \texttt{update\_weights\_from\_tensor} /
+\texttt{update\_weights\_from\_distributed} with
+\texttt{flush\_cache=False}.
+\texttt{weight\_version} is a \emph{label on the delta}, not a radix key.
+In-flight requests keep private KV; the radix tree is patched in the
+background (\texttt{maintain\_all}).
+
+\paragraph{LMCache.}
+Route~A reads the existing HiddenStateStore (fp8/fp16 boundary
+activations).
+Chunk keys stay coupled to KV eviction; \dkv\ does not grow a second store.
+
+\paragraph{PEFT / HuggingFace.}
+\texttt{from\_peft\_state\_dict} accepts the usual
+\texttt{layers.$i$.self\_attn.k\_proj.lora\_A.weight} keys and PEFT
+scaling $\alpha/r$.
+The adapter file \emph{is} the delta descriptor.
+
+\paragraph{Multi-LoRA shared prefixes.}
+One physical row, keyed by the system-prompt tokens.
+Per adapter: a $\Delta W$ from base (or from the previously loaded
+adapter).
+$N$ tenants share one prefix instead of $N$ namespaced copies---the
+failure mode behind LMCache \#2961 and vLLM same-name corruption.
+
+\section{Experiments}
+\label{sec:exp}
+
+We evaluate on the reference engine shipped with \dkv: a Llama-style
+stack (RMSNorm, RoPE, GQA, SwiGLU) small enough to run on CPU, large
+enough that every algebraic claim is testable.
+This is a \emph{kill-criterion} validator, not a substitute for a 7B/70B
+serving study.
+If the idea is algebraically wrong, it fails here; if it survives, the
+remaining work is wiring and kernels, not a different algorithm.
+
+\paragraph{Protocol.}
+Prefill under $W_0$, commit a rank-$r$ LoRA on $k$/$v$ (and $q$ where
+noted) of every layer, materialize a patched view, compare against a
+\emph{fresh} prefill under $W_0+\Delta W$.
+Metrics: max relative KV $\ell_2$, min cosine, next-token KL (nats),
+log-prob MAE, and the KIVI-4bit grouped-quantization floor of the fresh
+cache.
+Default toy: $L{=}4$, $d{=}64$, $n_{\mathrm{heads}}{=}4$, $n{=}64$,
+rank $4$, LoRA scale $10^{-2}$.
+
+\begin{table}[t]
+\centering
+\caption{Kill-criterion validator. Rank-4 LoRA, scale $0.01$, seq $64$.
+All four routes sit inside the KIVI-4bit floor ($0.066$) with next-token
+KL $=0$ at reported precision. Hybrid is the default.}
+\label{tab:bench}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Route & max rel.\ $\ell_2$ & KL (nats) & logprob MAE & within KIVI-4bit & FLOP ratio \\
+\midrule
+Zeroth-order  & $0.0035$ & $0$ & $3.8{\times}10^{-4}$ & yes & $0.034$ \\
+Analytic      & $0.0000$ & $0$ & $5.2{\times}10^{-7}$ & yes & $0.82$ \\
+Probe         & $0.0021$ & $0$ & $1.8{\times}10^{-4}$ & yes & $0.10$ \\
+Hybrid        & $0.0021$ & $0$ & $1.7{\times}10^{-4}$ & yes & $0.085$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What Table~\ref{tab:bench} says.}
+(1)~The adapter path on cached $X$ already beats a 4-bit KV cache, at
+$3.4\%$ of prefill.
+(2)~The subspace/probe residual tightens $\ell_2$ from $0.0035$ to
+$0.0021$ at a still-cheap $8$--$10\%$ of prefill.
+(3)~Analytic is numerically exact on this stack (first-order plus
+committed $W'$ plus stride reset) but, on $n{=}64$, the dense softmax
+Jacobian makes it only a mild win---as predicted by the cost model.
+(4)~Hybrid matches probe quality at lower billed FLOPs because boundary
+layers stay exact and only high-$\tilde\kappa$ layers pay the residual
+gate.
+
+\paragraph{Layer-0 exactness.}
+For a $k$/$v$-only LoRA on layer~$0$, \eqref{eq:exact} matches a fresh
+prefill to $<2{\times}10^{-5}$ absolute error on both $K$ and $V$, and
+cosine $>0.9999$.
+This is the algebraic claim, not a tuned approximation.
+
+\paragraph{Subspace vs.\ rank-1 $\mu$.}
+On a synthetic residual $R=CB^\top+\mathbf{1}\mu_\perp^\top$ with
+varying codes $C$, per-token least-squares onto $B$ recovers $\mathrm{col}(B)$
+and strictly beats a probe mean-shift.
+
+\paragraph{ROME.}
+A rank-1 write $uv^\top$ into \texttt{down\_proj} of layer~$1$ (scale
+$0.05$) patches through the probe route; next-token KL remains defined and
+finite, and the engine does not flush~\citep{meng2023memit}.
+The delta descriptor is literally two vectors.
+
+\paragraph{Correctness floor.}
+A LoRA of scale $1.0$ (outside the patchable regime) is a miss: the
+lattice refuses, and the engine prefills.
+A too-tight $\varepsilon$ with a measured residual likewise falls back.
+
+\paragraph{Replay.}
+After a hybrid materialize, a second lookup is \texttt{STRICT} and
+replays the stored patched-minus-base increment to numerical identity
+($10^{-5}$).
+
+Forty-eight unit tests cover RoPE linearity, RMSNorm / softmax /
+SwiGLU Jacobians, lattice decisions, PEFT parsing, adapter-swap
+subtraction, paged scatter/gather, and connector duck-types.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Prefix caches.}
+PagedAttention~\citep{kwon2023vllm} and SGLang~\citep{zheng2024sglang}
+made token-prefix reuse the default.
+LMCache~\citep{lmcache} extends that reuse off-device and stores hidden
+states.
+All of them still namespace or flush when $W$ moves.
+\dkv\ reuses their storage and connectors; it changes the
+\emph{invalidation policy}.
+
+\paragraph{KV reuse under context shift.}
+CacheBlend~\citep{yao2024cacheblend} selectively recomputes tokens whose
+layer-1 KV residual is large when stitching cached chunks.
+Probe offset estimators do the same for agent chunks.
+Both are \emph{context}-axis techniques.
+\dkv\ reuses the probe/gate machinery with a new trigger (weight delta)
+and a new structure (column space of $B$).
+
+\paragraph{Low-rank weights.}
+LoRA~\citep{hu2022lora} made $\Delta W=sBA$ the production adapter format.
+ROME~\citep{meng2022rome} and MEMIT~\citep{meng2023memit} are rank-1 edits.
+\dkv\ treats those files as the delta descriptor rather than as a reason
+to drop the cache.
+
+\paragraph{KV compression.}
+KIVI~\citep{liu2024kivi} and related methods quantize or evict KV under a
+\emph{fixed} $W$.
+We use KIVI's 4-bit noise as a \emph{floor}: a patch that sits inside
+that floor is in the noise of a serving optimization operators already
+ship.
+
+\paragraph{Incremental view maintenance.}
+The database analogy is deliberate~\citep{gupta1993ivm}.
+Materialized views are maintained under $\Delta\mathrm{relation}$; we
+maintain KV under $\Delta W$.
+
+\section{Limitations}
+\label{sec:limit}
+
+The reference validator is a 4-layer, $d{=}64$ CPU model.
+It can falsify the algebra; it cannot measure tail latency on Llama-3-70B.
+Error compounding through $32$--$80$ layers, paged GPU kernels for the
+adapter path, and the one-line vLLM/SGLang hooks are remaining engineering
+work, not open research questions about \emph{whether} $\Delta K=\mathrm{RoPE}(X\Delta W_K^\top)$.
+Analytic first-order still densifies $\Delta S$ in the PyTorch path; a
+low-rank attention kernel would change the flop ratio, not the Jacobian.
+\dkv\ will not patch a full SFT or an architecture swap---by design.
+In-flight decode under a mid-token weight update is out of scope: live
+requests keep private KV; the radix/paged store is patched in the
+background.
+
+\section{Conclusion}
+\label{sec:conc}
+
+Serving engines already know how to reuse KV along the token axis.
+They treat the weight axis as a cache apocalypse.
+That is unnecessary for the $\Delta W$ that actually occur in production:
+LoRA swaps, rank-1 edits, quant grid changes, KL-bounded RL steps.
+\dkv\ makes the cache a materialized view, patches it with exact
+projection math where $X$ is known and with a $\kappa$-anchored hybrid
+otherwise, and falls back to today's recompute when it cannot.
+The kill-criterion holds on a real (if small) Transformer.
+The connectors fit engines that already exist.
+The next proof is a large-model serving run; the algorithm does not
+need to change for that proof to be well-defined.
+
+\section*{Acknowledgements}
+Correspondence: \texttt{itsrishabhforyou@gmail.com}.
+The reference implementation, architecture notes, and ICLR-formatted
+companion live in the same repository.
+
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\appendix
+\section{Jacobians}
+\label{app:jac}
+
+\paragraph{RMSNorm.}
+Let $\mathrm{ms}=\mathrm{mean}(x^2)$, $\mathrm{rms}=\sqrt{\mathrm{ms}+\epsilon}$,
+$y=(x/\mathrm{rms})\odot w$. Then
+$\mathrm{d}(\mathrm{ms})=2\,\mathrm{mean}(x\odot\mathrm{d}x)$,
+$\mathrm{d}(\mathrm{rms})=\mathrm{d}(\mathrm{ms})/(2\,\mathrm{rms})$, and
+\begin{equation}
+  \mathrm{d}y
+  \;=\;
+  \frac{\mathrm{d}x\cdot\mathrm{rms}-x\cdot\mathrm{d}(\mathrm{rms})}{\mathrm{rms}^2}\odot w.
+\end{equation}
+
+\paragraph{Softmax.}
+For a row $a=\mathrm{softmax}(s)$,
+$J_{\mathrm{softmax}}(a)=\mathrm{diag}(a)-aa^\top$, so
+$J_{\mathrm{softmax}}(a)[\delta]=a\odot(\delta-\langle a,\delta\rangle)$.
+This is exact-linear in $\delta$.
+
+\paragraph{SwiGLU.}
+$\mathrm{silu}(z)=z\,\sigma(z)$,
+$\mathrm{silu}'(z)=\sigma(z)+z\,\sigma(z)(1-\sigma(z))$.
+The MLP output differential is
+$\mathrm{d}y = \bigl((\mathrm{silu}'(g)\odot\mathrm{d}g)\odot u
+ + \mathrm{silu}(g)\odot\mathrm{d}u\bigr)W_{\mathrm{down}}^\top$
+plus the local $\Delta W$ adapter path on the stale activation.
+
+\section{Worked LoRA path}
+\label{app:lora}
+
+PEFT computes $\Delta y = s\,(x A^\top)B^\top$.
+Codes $c=s\,xA^\top\in\mathbb{R}^{n\times r}$ and basis $B$ are the
+compressed $\Delta K$/$\Delta V$ \emph{before} RoPE.
+After RoPE on $K$, the basis is position-dependent, so we store a dense
+$\Delta K\in\mathbb{R}^{n\times n_{\mathrm{kv}}\times d_h}$.
+Compression relative to a full KV layer is $d_{\mathrm{kv}}/r$ before
+RoPE ($64\times$ at $d_{\mathrm{kv}}=4096$, $r=64$).
+An adapter swap concatenates $(A_B,\,{-}A_A)$ and $(B_B,\,B_A)$, i.e.\
+rank adds, without materializing $\Delta W$.
+
+\section{Lookup algorithm}
+\label{app:lookup}
+
+\begin{enumerate}[leftmargin=1.4em]
+\item Hash the token prefix (no adapter, no weight version).
+\item If no row: \texttt{MISS}, prefill, insert.
+\item If row version equals $W_{\mathrm{cur}}$: \texttt{STRICT}, replay
+      $\mathrm{base}+\sum\mathrm{patches}$.
+\item If no $\Delta W$ path in the lineage DAG: \texttt{MISS}.
+\item If $\|\Delta W\|$ proxy exceeds the patchable regime: \texttt{MISS}.
+\item Pick a route (default hybrid) whose billed FLOPs are $<$ prefill.
+\item Materialize. If the residual is \emph{measured} and
+      $\hat\varepsilon>\varepsilon$: \texttt{MISS}, prefill.
+\item Else append the full patched-minus-base increment; rebase if
+      $\hat\varepsilon\ge 0.8\,\varepsilon$.
+\end{enumerate}
+
+\section{Reproducing the validator}
+\label{app:repro}
+
+\begin{verbatim}
+pip install -e ".[dev]"
+python -m deltakv bench --seq 64 --rank 4 --scale 0.01
+pytest
+\end{verbatim}
+\texttt{bench} prints Table~\ref{tab:bench}.
+Architecture notes live in \texttt{docs/ARCHITECTURE.md}; engine wiring
+in \texttt{docs/INTEGRATION.md}; the ICLR-formatted companion in
+\texttt{paper/}.
+
+\end{document}
