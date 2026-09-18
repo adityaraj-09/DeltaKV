@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deltakv"
+version = "0.1.0"
+description = "Weight-delta-aware KV cache maintenance for LLM serving"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "DeltaKV" }]
+keywords = ["llm", "kv-cache", "lora", "vllm", "sglang", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+hf = ["transformers>=4.40", "peft>=0.11"]
+serve = ["fastapi>=0.110", "uvicorn>=0.27"]
+
+[project.scripts]
+deltakv = "deltakv.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/deltakv/deltakv"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,0 +1,61 @@
+"""ΔKV: weight-delta-aware KV cache maintenance."""
+
+from deltakv.config import DeltaKVConfig
+from deltakv.deltas import (
+    LayerDelta,
+    LowRankFactors,
+    WeightDelta,
+    adapter_swap,
+    compose_deltas,
+    from_peft_state_dict,
+    lora_delta,
+    lora_layer,
+    quant_delta,
+    random_lora_factors,
+    rl_step_delta,
+    rome_delta,
+)
+from deltakv.engine import DeltaKVEngine, MaintainResult
+from deltakv.metrics import CompareReport, compare_kv, next_token_kl
+from deltakv.model import ToyConfig, ToyTransformer
+from deltakv.types import (
+    CompatibilityLevel,
+    DeltaKind,
+    ErrorBudget,
+    ErrorEstimate,
+    LookupDecision,
+    PatchRoute,
+    WeightVersion,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "CompareReport",
+    "CompatibilityLevel",
+    "DeltaKVConfig",
+    "DeltaKVEngine",
+    "DeltaKind",
+    "ErrorBudget",
+    "ErrorEstimate",
+    "LayerDelta",
+    "LookupDecision",
+    "LowRankFactors",
+    "MaintainResult",
+    "PatchRoute",
+    "ToyConfig",
+    "ToyTransformer",
+    "WeightDelta",
+    "WeightVersion",
+    "adapter_swap",
+    "compare_kv",
+    "compose_deltas",
+    "from_peft_state_dict",
+    "lora_delta",
+    "lora_layer",
+    "next_token_kl",
+    "quant_delta",
+    "random_lora_factors",
+    "rl_step_delta",
+    "rome_delta",
+]
