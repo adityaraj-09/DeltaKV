@@ -26,8 +26,8 @@
 
 
 
-\newcommand{\headeright}{A Preprint}
-\newcommand{\undertitle}{A Preprint}
+\newcommand{\headeright}{}
+\newcommand{\undertitle}{}
 \newcommand{\shorttitle}{\@title}
 
 \usepackage{fancyhdr}
@@ -35,8 +35,8 @@
 \pagestyle{fancy}
 \renewcommand{\headrulewidth}{0.4pt}
 \fancyheadoffset{0pt}
-\rhead{\scshape \footnotesize \headeright}
-\chead{\shorttitle}
+\lhead{\scshape \footnotesize \headeright}
+\rhead{\scshape \footnotesize \shorttitle}
 \cfoot{\thepage}
 
 
@@ -223,8 +223,7 @@
     \centering
     {\LARGE\sc \@title\par}
     \@bottomtitlebar
-    \textsc{\undertitle}\\
-    \vskip 0.1in
+    \vskip 0.12in
     \def\And{%
       \end{tabular}\hfil\linebreak[0]\hfil%
       \begin{tabular}[t]{c}\bf\rule{\z@}{24\p@}\ignorespaces%
@@ -234,7 +233,10 @@
       \begin{tabular}[t]{c}\bf\rule{\z@}{24\p@}\ignorespaces%
     }
     \begin{tabular}[t]{c}\bf\rule{\z@}{24\p@}\@author\end{tabular}%
-  \vskip 0.4in \@minus 0.1in \center{\@date}   \vskip 0.2in
+    \ifx\@date\empty\else
+      \vskip 0.25in \@minus 0.1in \center{\@date}
+    \fi
+    \vskip 0.2in
   }
 }
 
