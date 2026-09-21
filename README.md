@@ -77,7 +77,7 @@ The field already proved the adjacent facts and filed them under other names. Δ
 | AgentKVShift / CacheBlend | Probe offset + residual-gated recompute | New trigger (weight delta, not context staleness) and low-rank ΔW structure |
 | RoPE | Linearity: `RoPE(K+ΔK) = RoPE(K)+RoPE(ΔK)` | Exactness of the layer-1 key patch |
 
-See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the exact vLLM / SGLang / LMCache wiring, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the math, [paper/](paper/) for an ICLR-style write-up, and [paper/arxiv/](paper/arxiv/) for an arXiv-style preprint.
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the exact vLLM / SGLang / LMCache wiring, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the math, [paper/](paper/) for an ICLR-style write-up, and [paper/arxiv/](paper/arxiv/) for a camera-ready article (no preprint banner).
 
 ## Routes
 

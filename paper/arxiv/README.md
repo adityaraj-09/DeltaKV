@@ -1,13 +1,12 @@
-# arXiv-style preprint
+# Camera-ready paper (arXiv layout)
 
-Kour [arxiv-style](https://github.com/kourgeorge/arxiv-style): Times,
-wide single column, “A Preprint” header, keywords, dated title block.
+Single-column Times article using Kour `arxiv.sty`, **without** preprint
+branding: no “A Preprint” header or subtitle, running heads are author /
+short title, empty date, numbered algorithm and architecture figure.
 
 ```bash
 cd paper/arxiv
 make
 ```
 
-A compiled `main.pdf` is in this folder. Companion ICLR conference
-formatting is in `paper/` (one directory up). Numbers match
-`python -m deltakv bench --seq 64 --rank 4 --scale 0.01`.
+The compiled `main.pdf` is the camera-ready PDF.
