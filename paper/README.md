@@ -3,7 +3,7 @@
 | Layout | Path | Look |
 |---|---|---|
 | ICLR conference | [`paper/`](.) | Double-blind, side ruler, 5.5in column |
-| arXiv preprint | [`paper/arxiv/`](arxiv/) | Named author, “A Preprint” header, 6.5in column |
+| Camera-ready article | [`paper/arxiv/`](arxiv/) | Named author, no preprint banner, 6.5in column |
 
 ```bash
 cd paper && make          # ICLR
