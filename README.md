@@ -26,7 +26,17 @@ It does **not** fork vLLM or SGLang. It plugs into the extension points those en
 ```bash
 pip install -e ".[dev]"
 python -m deltakv bench
+python -m deltakv maintain          # toy: prefill → ΔW → patch, no flush
 pytest
+```
+
+Weight-aware maintenance on a published SmolLM (CPU, copies HF weights into
+the reference decoder):
+
+```bash
+pip install -e ".[hf]"
+python -m deltakv maintain --model HuggingFaceTB/SmolLM2-135M --seq 32
+# or: python examples/smol_maintain.py
 ```
 
 ## Smallest validator (the kill criterion)

@@ -1,4 +1,4 @@
-"""CLI: ``python -m deltakv bench`` runs the smallest validator on CPU."""
+"""CLI: ``python -m deltakv maintain`` runs weight-aware cache maintenance."""
 
 from __future__ import annotations
 
@@ -104,6 +104,122 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _toy_from_args(args: argparse.Namespace) -> ToyTransformer:
+    cfg = ToyConfig(
+        n_layers=args.layers,
+        d_model=args.d_model,
+        n_heads=max(1, args.d_model // 16) if args.d_model >= 16 else 4,
+        n_kv_heads=max(1, args.d_model // 16) if args.d_model >= 16 else 4,
+        d_ff=args.d_model * 2,
+        vocab_size=256,
+    )
+    while cfg.d_model % cfg.n_heads != 0:
+        cfg.n_heads -= 1
+    cfg.n_kv_heads = cfg.n_heads
+    return ToyTransformer(cfg)
+
+
+def _tokens_for_model(model: ToyTransformer, args: argparse.Namespace) -> tuple[torch.Tensor, str | None]:
+    """Return token ids and an optional decoded prompt label."""
+    if args.model:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.model)
+        prompt = args.prompt or "The capital of France is"
+        ids = tok(prompt, return_tensors="pt").input_ids.view(-1)
+        if args.seq and int(ids.numel()) > args.seq:
+            ids = ids[: args.seq]
+        return ids.to(dtype=torch.int64), prompt
+    n = args.seq if args.seq else 64
+    return torch.randint(0, model.cfg.vocab_size, (n,)), None
+
+
+def _print_report(label: str, result) -> None:
+    r = result.report
+    d = result.decision
+    print(
+        f"  {label:12s}  decision={d.level.value:8s} route={d.route.value:8s}  "
+        f"reason={d.reason}"
+    )
+    if r is None:
+        return
+    kl = f"{r.next_token_kl:.4e}" if r.next_token_kl is not None else "n/a"
+    lp = f"{r.logprob_mae:.4e}" if r.logprob_mae is not None else "n/a"
+    kivi = f"{r.kivi4_floor:.4f}" if r.kivi4_floor is not None else "n/a"
+    print(
+        f"               maxRelL2={r.max_relative_l2:.4f}  minCos={r.min_cosine:.4f}  "
+        f"KL={kl}  logprobMAE={lp}  kivi4={kivi}  withinKIVI={r.within_kivi4}  "
+        f"flop_ratio={d.flop_ratio:.4f}"
+    )
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    """Prefill under W0, publish ΔW without flush, patch the stored prefix."""
+    torch.manual_seed(args.seed)
+    rng = torch.Generator().manual_seed(args.seed)
+    if args.model:
+        from deltakv.hf_model import load_hf_decoder
+
+        print(f"loading {args.model} into the ΔKV decoder …", flush=True)
+        model = load_hf_decoder(args.model)
+    else:
+        model = _toy_from_args(args)
+    c = model.cfg
+    engine = DeltaKVEngine(
+        model,
+        DeltaKVConfig(error_budget=ErrorBudget(relative_kv_l2=args.epsilon, next_token_kl=1e-2)),
+    )
+    tokens, prompt = _tokens_for_model(model, args)
+    logits0, _kv0 = engine.prefill(tokens)
+    delta = _build_lora(model, args.rank, args.scale, rng)
+    engine.commit_delta(delta)
+    decision, entry = engine.lookup(tokens)
+    print(
+        f"ΔKV maintain  model={args.model or 'toy'}  "
+        f"layers={c.n_layers} d={c.d_model} heads={c.n_heads}/{c.n_kv_heads}  "
+        f"seq={int(tokens.numel())} rank={args.rank} scale={args.scale} route={args.route}"
+    )
+    if prompt:
+        print(f"  prompt={prompt!r}")
+    print(
+        f"  after ΔW publish (no flush): lookup={decision.level.value}  "
+        f"route={decision.route.value}  stored_version={entry.current_version.id if entry else 'none'}  "
+        f"current={engine.current.id}  reason={decision.reason}"
+    )
+    maintained = engine.maintain_all(route=args.route)
+    print(f"  maintain_all patched {len(maintained)} prefix(es) onto {engine.current.id}")
+    # Score the maintained view against a cold prefill under the new weights.
+    scored = engine.evaluate_against_fresh(tokens, route=args.route)
+    _print_report("patched-vs-fresh", scored)
+    gen, gen_dec = engine.generate(tokens, max_new=args.max_new)
+    print(
+        f"  generate +{args.max_new} from patched KV  "
+        f"decision={gen_dec.level.value}  tokens={gen.tolist()[-args.max_new:]}"
+    )
+    if args.model:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.model)
+        print(f"  decoded={tok.decode(gen.tolist(), skip_special_tokens=True)!r}")
+    r = scored.report
+    if r is None:
+        return 1
+    ok = (
+        r.next_token_kl is not None
+        and r.next_token_kl <= 1e-2
+        and r.max_relative_l2 <= 0.10
+        and bool(r.within_kivi4)
+    )
+    print(
+        "kill criterion: "
+        + ("PASS" if ok else "FAIL")
+        + "  (KL ≲ 1e-2, mid-depth rel L2 ≲ 0.10, maxRelL2 ≲ KIVI-4bit)"
+    )
+    # logits0 kept so a reader can see we did prefill under W0
+    del logits0
+    return 0 if ok else 2
+
+
 def cmd_demo(_args: argparse.Namespace) -> int:
     torch.manual_seed(0)
     model = ToyTransformer(ToyConfig(n_layers=3, d_model=48, n_heads=4, n_kv_heads=4, d_ff=96))
@@ -151,6 +267,23 @@ def main(argv: list[str] | None = None) -> int:
 
     d = sub.add_parser("demo", help="ROME rank-1 edit patched through the cache")
     d.set_defaults(func=cmd_demo)
+
+    m = sub.add_parser(
+        "maintain",
+        help="weight-aware cache maintenance: prefill, publish ΔW, patch, score",
+    )
+    m.add_argument("--model", type=str, default="", help="HF repo id, e.g. HuggingFaceTB/SmolLM2-135M")
+    m.add_argument("--prompt", type=str, default="")
+    m.add_argument("--layers", type=int, default=4)
+    m.add_argument("--d-model", type=int, default=64)
+    m.add_argument("--seq", type=int, default=0, help="token budget (toy default 64; HF truncates the prompt)")
+    m.add_argument("--rank", type=int, default=4)
+    m.add_argument("--scale", type=float, default=0.01)
+    m.add_argument("--epsilon", type=float, default=0.15)
+    m.add_argument("--seed", type=int, default=0)
+    m.add_argument("--route", type=str, default="hybrid", choices=("zeroth", "analytic", "probe", "hybrid"))
+    m.add_argument("--max-new", type=int, default=8)
+    m.set_defaults(func=cmd_maintain)
 
     args = p.parse_args(argv)
     return int(args.func(args))
