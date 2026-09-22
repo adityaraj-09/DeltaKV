@@ -18,7 +18,7 @@ if __name__ == "__main__":
         "--model",
         "HuggingFaceTB/SmolLM2-135M",
         "--prompt",
-        "The capital of France is",
+        "France is a country in Western Europe. It is known for wine, cheese, and the city of lights. Many students learn that Paris sits on the Seine. The capital of France is",
         "--seq",
         "32",
         "--rank",

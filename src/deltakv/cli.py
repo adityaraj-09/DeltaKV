@@ -125,7 +125,11 @@ def _tokens_for_model(model: ToyTransformer, args: argparse.Namespace) -> tuple[
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(args.model)
-        prompt = args.prompt or "The capital of France is"
+        prompt = args.prompt or (
+            "France is a country in Western Europe. It is known for wine, cheese, "
+            "and the city of lights. Many students learn that Paris sits on the Seine. "
+            "The capital of France is"
+        )
         ids = tok(prompt, return_tensors="pt").input_ids.view(-1)
         if args.seq and int(ids.numel()) > args.seq:
             ids = ids[: args.seq]
