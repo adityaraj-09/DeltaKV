@@ -24,6 +24,7 @@ from deltakv.metrics import (
     logprob_error,
     next_token_kl,
 )
+from deltakv.hf_model import copy_llama_weights, hf_available, load_hf_decoder, toy_config_from_hf
 from deltakv.model import ToyConfig, ToyTransformer
 from deltakv.types import (
     CompatibilityLevel,
@@ -57,6 +58,10 @@ __all__ = [
     "WeightDelta",
     "WeightVersion",
     "adapter_swap",
+    "copy_llama_weights",
+    "hf_available",
+    "load_hf_decoder",
+    "toy_config_from_hf",
     "attach_quality",
     "compare_kv",
     "kivi_noise_floor",
