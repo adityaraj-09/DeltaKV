@@ -107,6 +107,23 @@ engine.commit_delta(delta)
 `model.layers.{i}.self_attn.k_proj.lora_A.weight` keys and PEFT scaling
 `α/r`. Adapter swap is `adapter_swap(old_delta, new_delta)` (rank adds).
 
+To **run** maintenance on a published Llama-style checkpoint (SmolLM2,
+TinyLlama, …) copy the weights into the reference decoder and use the
+same engine as the toy validator:
+
+```python
+from deltakv import DeltaKVEngine, load_hf_decoder
+
+model = load_hf_decoder("HuggingFaceTB/SmolLM2-135M")
+engine = DeltaKVEngine(model)
+engine.prefill(token_ids)          # cache under W0
+engine.commit_delta(delta)         # PEFT / LoRA WeightDelta; does not flush
+engine.maintain_all(route="hybrid")
+engine.evaluate_against_fresh(token_ids)
+```
+
+`python -m deltakv maintain --model HuggingFaceTB/SmolLM2-135M` is that loop.
+
 ## veRL / Mooncake / sleep-wake
 
 Do **not** call `sleep(mode="recompute")` or Mooncake's store flush on a
